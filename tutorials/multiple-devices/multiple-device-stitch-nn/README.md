@@ -12,6 +12,8 @@ Cameras must be **vertically aligned** and have **sufficient field-of-view overl
 
 Stitching, tiling and YOLO detections run on host computer can be **costly on the processing resources** - especially with larger number of cameras connected - and the output FPS will depend on the host CPU power. If output FPS is too low, **try lowering the resolution** with `--input_size` parameter.
 
+This example is intended as a conceptual demonstration rather than a production-ready implementation. It provides a foundation for users to extend and refine as needed.
+
 ## Demo
 
 ![example](media/stitching.gif)
