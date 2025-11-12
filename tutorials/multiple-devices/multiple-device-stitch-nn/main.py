@@ -25,13 +25,15 @@ def createPipeline(pipeline):
     output = camRgb.requestOutput(
         IMG_SHAPE, dai.ImgFrame.Type.NV12, dai.ImgResizeMode.CROP, fps=args.fps_limit
     )
-    return pipeline, output
+    input = camRgb.inputControl.createInputQueue()
+    return pipeline, input, output
 
 
 with contextlib.ExitStack() as stack:
     visualizer = dai.RemoteConnection(httpPort=8082)
     deviceInfos = dai.Device.getAllAvailableDevices()
     print("=== Found devices: ", deviceInfos)
+    inputs = []
     outputs = []
     pipelines = []
 
@@ -51,10 +53,10 @@ with contextlib.ExitStack() as stack:
         if eepromData.productName != "":
             print("   >>> Product name:", eepromData.productName)
 
-        pipeline, output = createPipeline(pipeline)
+        pipeline, input, output = createPipeline(pipeline)
         pipelines.append(pipeline)
-
         outputs.append(output)
+        inputs.append(input)
 
     platform = device.getPlatform()
     # Get model based on platform type from yaml file
@@ -112,8 +114,12 @@ with contextlib.ExitStack() as stack:
     visualizer.addTopic("Stitched", stitch_pl.out_full_res)
     visualizer.addTopic("Patcher", patcher.out)
 
-    for p in pipelines:
+    ctrl = dai.CameraControl()
+    ctrl.setAutoFocusMode(dai.CameraControl.AutoFocusMode.CONTINUOUS_VIDEO)
+
+    for i, p in enumerate(pipelines):
         p.start()
+        inputs[i].send(ctrl)
 
     # Register visualizer with the first pipeline
     visualizer.registerPipeline(pipelines[0])
