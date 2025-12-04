@@ -1,0 +1,1290 @@
+#!/usr/bin/env python3
+import cv2
+import numpy as np
+import threading
+import time
+import warnings
+import os
+import open3d as o3d
+from datetime import timedelta
+
+## GUI-related imports
+import tkinter as tk
+from tkinter import ttk
+
+import depthai as dai
+
+# ==========================================
+# 🔧 用户配置区域
+# ==========================================
+# 保存路径 (按 's' 键保存)
+SAVE_DIR = r"D:\\oak-examples-main\\depth-measurement\\3d-measurement\\tof-pointcloud\\saved_cloud\\branch\\3"
+
+# 若多台相机同时在线，可指定 SR-POE 的静态 IP 来锁定设备
+TARGET_DEVICE_IP = "192.168.1.101"
+
+# OAK-D SR 的典型接口定义
+RGB_SOCKET = dai.CameraBoardSocket.CAM_C
+TOF_SOCKET = dai.CameraBoardSocket.CAM_A
+
+# 旋转设置
+MANUAL_ROTATE_TOF_180 = False
+# ==========================================
+
+# Point cloud globals
+latest_pointcloud_final = None
+pointcloud_lock = threading.Lock()
+vis_final = None
+pointcloud_thread = None
+pointcloud_running = False
+needs_update_final = False
+
+# Pause/unpause control
+paused = False
+pause_lock = threading.Lock()
+
+# View reset control
+first_update_final = True
+
+# Store latest frames
+latest_frames = {"final_depth": None, "color": None}
+
+# Intrinsics
+CAMERA_INTRINSICS = {
+    "fx": None,
+    "fy": None,
+    "cx": None,
+    "cy": None,
+}
+
+# Point cloud parameters
+pointcloud_params = {
+    "enabled": True,
+    "decimation": 1,
+    "max_distance": 7500,
+    # 轴向裁剪范围（单位：毫米，应用于最终坐标系，y 轴向下为负）
+    "x_min": -5000,
+    "x_max": 5000,
+    "y_min": -5000,
+    "y_max": 5000,
+}
+
+
+def toggle_pause():
+    global paused
+    with pause_lock:
+        paused = not paused
+        return paused
+
+
+def is_paused():
+    with pause_lock:
+        return paused
+
+
+def depth_to_pointcloud(
+    depth_frame,
+    rgb_frame,
+    intrinsics,
+    max_distance=3000,
+    decimation=1,
+    x_min_mm=-5000,
+    x_max_mm=5000,
+    y_min_mm=-5000,
+    y_max_mm=5000,
+):
+    """生成彩色点云 (单位：米)"""
+    if depth_frame is None or depth_frame.size == 0:
+        return np.array([]), np.array([]), np.array([]), None
+
+    h, w = depth_frame.shape
+    fx, fy = intrinsics["fx"], intrinsics["fy"]
+    cx, cy = intrinsics["cx"], intrinsics["cy"]
+
+    # Decimate depth
+    depth_decimated = depth_frame[::decimation, ::decimation]
+
+    # Create coordinate grids
+    dh, dw = depth_decimated.shape
+    u, v = np.meshgrid(np.arange(0, w, decimation), np.arange(0, h, decimation))
+    u = u[:dh, :dw]
+    v = v[:dh, :dw]
+
+    # Filter out invalid depths (Range: 20cm ~ max_distance)
+    valid_mask = (depth_decimated > 200) & (depth_decimated < max_distance)
+
+    if np.sum(valid_mask) == 0:
+        return np.array([]), np.array([]), np.array([]), None
+
+    u_valid = u[valid_mask]
+    v_valid = v[valid_mask]
+    z_valid = depth_decimated[valid_mask]
+
+    # 1. 计算原始 3D 坐标 (单位: mm)
+    x_mm = (u_valid - cx) * z_valid / fx
+    y_mm = (v_valid - cy) * z_valid / fy
+    z_mm = z_valid
+
+    # 2. 转换为 米 (Meters)
+    x_m = x_mm / 1000.0
+    y_m = y_mm / 1000.0
+    z_m = z_mm / 1000.0
+
+    # 3. 坐标系旋转 (绕 X 轴 180°)
+    x = x_m
+    y = -y_m
+    z = -z_m
+
+    # 5. 轴向裁剪（以最终坐标系为准，单位：毫米）
+    x_mm_final = x * 1000.0
+    y_mm_final = y * 1000.0
+
+    x_lo, x_hi = sorted([x_min_mm, x_max_mm])
+    y_lo, y_hi = sorted([y_min_mm, y_max_mm])
+
+    axis_mask = (
+        (x_mm_final >= x_lo)
+        & (x_mm_final <= x_hi)
+        & (y_mm_final >= y_lo)
+        & (y_mm_final <= y_hi)
+    )
+
+    if np.sum(axis_mask) == 0:
+        return np.array([]), np.array([]), np.array([]), None
+
+    x = x[axis_mask]
+    y = y[axis_mask]
+    z = z[axis_mask]
+
+    # 4. 处理颜色
+    colors_norm = None
+    if rgb_frame is not None:
+        rgb_decimated = rgb_frame[::decimation, ::decimation]
+        rgb_decimated = rgb_decimated[:dh, :dw]
+
+        valid_colors_bgr = rgb_decimated[valid_mask][axis_mask]
+        valid_colors_rgb = valid_colors_bgr[:, [2, 1, 0]]
+        colors_norm = valid_colors_rgb.astype(np.float64) / 255.0
+
+    return x, y, z, colors_norm
+
+
+def create_open3d_pc(x, y, z, colors=None):
+    """创建 Open3D 点云对象"""
+    if len(x) == 0:
+        return o3d.geometry.PointCloud()
+
+    pcd = o3d.geometry.PointCloud()
+    points = np.column_stack((x, y, z))
+    pcd.points = o3d.utility.Vector3dVector(points)
+
+    if colors is not None:
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    return pcd
+
+
+def save_all_data():
+    global latest_frames, latest_pointcloud_final
+
+    if not os.path.exists(SAVE_DIR):
+        try:
+            os.makedirs(SAVE_DIR)
+            print(f"📂 Created directory: {SAVE_DIR}")
+        except Exception as e:
+            print(f"❌ Error creating directory: {e}")
+            return
+
+    timestamp = int(time.time() * 1000)
+    print(f"\n💾 Saving data to {SAVE_DIR}...")
+
+    # Save Images
+    if latest_frames["final_depth"] is not None:
+        cv2.imwrite(
+            os.path.join(SAVE_DIR, f"{timestamp}_depth_final_data.png"),
+            latest_frames["final_depth"],
+        )
+        vis = colorizeDepth(latest_frames["final_depth"])
+        cv2.imwrite(
+            os.path.join(SAVE_DIR, f"{timestamp}_depth_final_vis.png"), vis
+        )
+
+    if latest_frames["color"] is not None:
+        cv2.imwrite(os.path.join(SAVE_DIR, f"{timestamp}_color.png"), latest_frames["color"])
+
+    # Save Point Clouds
+    with pointcloud_lock:
+        final_data = latest_pointcloud_final
+
+    if final_data:
+        x, y, z, colors = final_data
+        pcd = create_open3d_pc(x, y, z, colors)
+        o3d.io.write_point_cloud(
+            os.path.join(SAVE_DIR, f"{timestamp}_pointcloud_final_rgb.ply"), pcd
+        )
+        print("  ✅ Saved Final RGB Point Cloud")
+
+    print("🎉 All files saved!\n")
+
+
+def pointcloud_visualization():
+    """Open3D 可视化线程 (单位: 米)"""
+    global vis_final, pointcloud_running
+    global latest_pointcloud_final, needs_update_final
+    global first_update_final
+
+    try:
+        vis_final = o3d.visualization.Visualizer()
+        vis_final.create_window(
+            window_name="RGB Point Cloud (Meters)", width=960, height=720
+        )
+
+        opt = vis_final.get_render_option()
+        if opt:
+            opt.background_color = np.array([0.05, 0.05, 0.05])
+            opt.point_size = 2.5
+
+        # 初始化一个假点，防止空几何报错
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(np.array([[0, 0, 0]]))
+        vis_final.add_geometry(pcd)
+
+        axis = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=0.2, origin=[0, 0, 0]
+        )
+        vis_final.add_geometry(axis)
+
+        print("✅ Open3D window created - Scale: Meters")
+
+        while pointcloud_running:
+            refresh = False
+            with pointcloud_lock:
+                if latest_pointcloud_final is not None and needs_update_final:
+                    x, y, z, colors = latest_pointcloud_final
+                    if len(x) > 0:
+                        points = np.column_stack((x, y, z))
+                        pcd.points = o3d.utility.Vector3dVector(points)
+                        if colors is not None:
+                            pcd.colors = o3d.utility.Vector3dVector(colors)
+
+                        refresh = True
+
+                        if first_update_final:
+                            vis_final.reset_view_point(True)
+                            first_update_final = False
+
+                    needs_update_final = False
+
+            if refresh:
+                vis_final.update_geometry(pcd)
+            if not vis_final.poll_events():
+                break
+            vis_final.update_renderer()
+            time.sleep(0.01)
+
+    except Exception as e:
+        print(f"❌ Error in Open3D: {e}")
+    finally:
+        try:
+            vis_final.destroy_window()
+        except Exception:
+            pass
+
+
+def start_pointcloud_thread():
+    global pointcloud_thread, pointcloud_running
+    if not pointcloud_running:
+        pointcloud_running = True
+        pointcloud_thread = threading.Thread(
+            target=pointcloud_visualization, daemon=True
+        )
+        pointcloud_thread.start()
+
+
+def stop_pointcloud_thread():
+    global pointcloud_running
+    pointcloud_running = False
+    if pointcloud_thread:
+        pointcloud_thread.join(timeout=1)
+
+
+def update_pointcloud_data():
+    global latest_pointcloud_final, needs_update_final
+
+    depth = latest_frames["final_depth"]
+    rgb = latest_frames["color"]
+
+    if depth is None or rgb is None:
+        return
+
+    try:
+        x, y, z, colors = depth_to_pointcloud(
+            depth,
+            rgb,
+            CAMERA_INTRINSICS,
+            max_distance=pointcloud_params["max_distance"],
+            decimation=max(1, pointcloud_params["decimation"]),
+            x_min_mm=pointcloud_params["x_min"],
+            x_max_mm=pointcloud_params["x_max"],
+            y_min_mm=pointcloud_params["y_min"],
+            y_max_mm=pointcloud_params["y_max"],
+        )
+
+        with pointcloud_lock:
+            latest_pointcloud_final = (x, y, z, colors)
+            needs_update_final = True
+
+    except Exception as e:
+        print(f"Error updating PC: {e}")
+
+
+def update_pointcloud_manual():
+    if not pointcloud_params["enabled"] or not pointcloud_running:
+        print("❌ Point cloud visualization not enabled")
+        return
+
+    if latest_frames["final_depth"] is None or latest_frames["color"] is None:
+        print("❌ No frame data available")
+        return
+
+    try:
+        x, y, z, colors = depth_to_pointcloud(
+            latest_frames["final_depth"],
+            latest_frames["color"],
+            CAMERA_INTRINSICS,
+            max_distance=pointcloud_params["max_distance"],
+            decimation=max(1, pointcloud_params["decimation"]),
+            x_min_mm=pointcloud_params["x_min"],
+            x_max_mm=pointcloud_params["x_max"],
+            y_min_mm=pointcloud_params["y_min"],
+            y_max_mm=pointcloud_params["y_max"],
+        )
+
+        with pointcloud_lock:
+            latest_pointcloud_final = (x, y, z, colors)
+            needs_update_final = True
+
+        status = "⏸️ PAUSED" if is_paused() else "🔴 LIVE"
+        print(
+            f"{status} Manual update: FINAL point cloud - {len(x)} points"
+        )
+    except Exception as e:
+        print(f"❌ Error updating point cloud: {e}")
+
+
+def reset_pointcloud_view():
+    if vis_final:
+        try:
+            vis_final.reset_view_point(True)
+            print("🔄 已重置点云视角")
+        except Exception as e:
+            print(f"⚠️ 无法重置视角: {e}")
+
+
+class FilterGUI:
+    def __init__(self, config_queue):
+        self.config_queue = config_queue
+        self.base_config_queue = None
+        self.confidence_config_queue = None
+
+        self.root = tk.Tk()
+        self.root.title("ToF Depth Filters + RGB Point Cloud")
+        self.root.geometry("300x1000")
+
+        # Filter parameters
+        self.median_filter_var = tk.StringVar(value="MEDIAN_OFF")
+
+        self.temporal_enable_var = tk.BooleanVar(value=True)
+        self.temporal_persistency_var = tk.StringVar(value="VALID_1_IN_LAST_5")
+        self.temporal_alpha_var = tk.DoubleVar(value=0.1)
+        self.temporal_delta_var = tk.IntVar(value=40)
+
+        self.speckle_enable_var = tk.BooleanVar(value=False)
+        self.speckle_range_var = tk.IntVar(value=50)
+        self.speckle_diff_threshold_var = tk.IntVar(value=2)
+
+        self.spatial_enable_var = tk.BooleanVar(value=False)
+        self.spatial_hole_filling_radius_var = tk.IntVar(value=2)
+        self.spatial_alpha_var = tk.DoubleVar(value=0.5)
+        self.spatial_delta_var = tk.IntVar(value=3)
+        self.spatial_num_iterations_var = tk.IntVar(value=1)
+
+        self.enable_phase_unwrapping_var = tk.BooleanVar(value=True)
+        self.enable_phase_shuffle_var = tk.BooleanVar(value=True)
+        self.enable_temperature_correction_var = tk.BooleanVar(value=True)
+        self.enable_fppn_correction_var = tk.BooleanVar(value=True)
+        self.enable_optical_correction_var = tk.BooleanVar(value=True)
+        self.enable_wiggle_correction_var = tk.BooleanVar(value=True)
+        self.enable_distortion_correction_var = tk.BooleanVar(value=True)
+        self.enable_burst_mode_var = tk.BooleanVar(value=False)
+
+        self.phase_unwrap_threshold_var = tk.DoubleVar(value=2.0)
+        self.phase_unwrap_level_var = tk.IntVar(value=5)
+
+        self.confidence_threshold_var = tk.IntVar(value=128)
+
+        self.pointcloud_enable_var = tk.BooleanVar(value=True)
+        self.pointcloud_decimation_var = tk.IntVar(value=1)
+        self.pointcloud_max_distance_var = tk.IntVar(value=7500)
+        self.pointcloud_x_min_var = tk.IntVar(value=-5000)
+        self.pointcloud_x_max_var = tk.IntVar(value=5000)
+        self.pointcloud_y_min_var = tk.IntVar(value=-5000)
+        self.pointcloud_y_max_var = tk.IntVar(value=5000)
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True)
+
+        pc_tab = ttk.Frame(notebook)
+        filters_tab = ttk.Frame(notebook)
+        tof_tab = ttk.Frame(notebook)
+
+        notebook.add(pc_tab, text="Point Cloud")
+        notebook.add(filters_tab, text="Filters")
+        notebook.add(tof_tab, text="ToF & Confidence")
+
+        # Point Cloud Controls (tab 1)
+        pointcloud_frame = ttk.LabelFrame(
+            pc_tab, text="Point Cloud Settings", padding=10
+        )
+        pointcloud_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Checkbutton(
+            pointcloud_frame,
+            text="Enable Point Clouds",
+            variable=self.pointcloud_enable_var,
+            command=self.update_pointcloud_settings,
+        ).pack(anchor="w")
+
+        ttk.Label(pointcloud_frame, text="Decimation:").pack(anchor="w")
+        decimation_scale = ttk.Scale(
+            pointcloud_frame,
+            from_=1,
+            to=10,
+            variable=self.pointcloud_decimation_var,
+            orient="horizontal",
+            command=self.update_pointcloud_settings,
+        )
+        decimation_scale.pack(fill="x", pady=2)
+
+        decimation_label = ttk.Label(pointcloud_frame, text="1")
+        decimation_label.pack(anchor="w")
+
+        def update_decimation_label(*args):
+            decimation_label.config(text=f"{self.pointcloud_decimation_var.get()}")
+
+        self.pointcloud_decimation_var.trace("w", update_decimation_label)
+
+        ttk.Label(pointcloud_frame, text="Max Distance (mm):").pack(anchor="w")
+        max_distance_scale = ttk.Scale(
+            pointcloud_frame,
+            from_=300,
+            to=10000,
+            variable=self.pointcloud_max_distance_var,
+            orient="horizontal",
+            command=self.update_pointcloud_settings,
+        )
+        max_distance_scale.pack(fill="x", pady=2)
+
+        max_distance_label = ttk.Label(pointcloud_frame, text="7500")
+        max_distance_label.pack(anchor="w")
+
+        def update_max_distance_label(*args):
+            max_distance_label.config(
+                text=f"{self.pointcloud_max_distance_var.get()}"
+            )
+
+        self.pointcloud_max_distance_var.trace("w", update_max_distance_label)
+
+        # X Range (mm)
+        ttk.Label(pointcloud_frame, text="X Min (mm):").pack(anchor="w")
+        x_min_scale = ttk.Scale(
+            pointcloud_frame,
+            from_=-10000,
+            to=0,
+            variable=self.pointcloud_x_min_var,
+            orient="horizontal",
+            command=self.update_pointcloud_settings,
+        )
+        x_min_scale.pack(fill="x", pady=2)
+
+        x_min_label = ttk.Label(pointcloud_frame, text=str(self.pointcloud_x_min_var.get()))
+        x_min_label.pack(anchor="w")
+
+        def update_x_min_label(*args):
+            x_min_label.config(text=f"{int(self.pointcloud_x_min_var.get())}")
+
+        self.pointcloud_x_min_var.trace("w", update_x_min_label)
+
+        ttk.Label(pointcloud_frame, text="X Max (mm):").pack(anchor="w")
+        x_max_scale = ttk.Scale(
+            pointcloud_frame,
+            from_=0,
+            to=10000,
+            variable=self.pointcloud_x_max_var,
+            orient="horizontal",
+            command=self.update_pointcloud_settings,
+        )
+        x_max_scale.pack(fill="x", pady=2)
+
+        x_max_label = ttk.Label(pointcloud_frame, text=str(self.pointcloud_x_max_var.get()))
+        x_max_label.pack(anchor="w")
+
+        def update_x_max_label(*args):
+            x_max_label.config(text=f"{int(self.pointcloud_x_max_var.get())}")
+
+        self.pointcloud_x_max_var.trace("w", update_x_max_label)
+
+        # Y Range (mm)
+        ttk.Label(pointcloud_frame, text="Y Min (mm):").pack(anchor="w")
+        y_min_scale = ttk.Scale(
+            pointcloud_frame,
+            from_=-10000,
+            to=0,
+            variable=self.pointcloud_y_min_var,
+            orient="horizontal",
+            command=self.update_pointcloud_settings,
+        )
+        y_min_scale.pack(fill="x", pady=2)
+
+        y_min_label = ttk.Label(pointcloud_frame, text=str(self.pointcloud_y_min_var.get()))
+        y_min_label.pack(anchor="w")
+
+        def update_y_min_label(*args):
+            y_min_label.config(text=f"{int(self.pointcloud_y_min_var.get())}")
+
+        self.pointcloud_y_min_var.trace("w", update_y_min_label)
+
+        ttk.Label(pointcloud_frame, text="Y Max (mm):").pack(anchor="w")
+        y_max_scale = ttk.Scale(
+            pointcloud_frame,
+            from_=0,
+            to=10000,
+            variable=self.pointcloud_y_max_var,
+            orient="horizontal",
+            command=self.update_pointcloud_settings,
+        )
+        y_max_scale.pack(fill="x", pady=2)
+
+        y_max_label = ttk.Label(pointcloud_frame, text=str(self.pointcloud_y_max_var.get()))
+        y_max_label.pack(anchor="w")
+
+        def update_y_max_label(*args):
+            y_max_label.config(text=f"{int(self.pointcloud_y_max_var.get())}")
+
+        self.pointcloud_y_max_var.trace("w", update_y_max_label)
+
+        control_frame = ttk.LabelFrame(
+            pc_tab, text="Point Cloud Controls", padding=10
+        )
+        control_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Button(control_frame, text="Pause/Resume", command=self.toggle_pause).pack(
+            side="left", padx=5
+        )
+        ttk.Button(
+            control_frame, text="Update Final", command=update_pointcloud_manual
+        ).pack(side="left", padx=5)
+        ttk.Button(
+            control_frame, text="Reset View", command=reset_pointcloud_view
+        ).pack(side="left", padx=5)
+        ttk.Button(
+            control_frame, text="SAVE ALL", command=save_all_data
+        ).pack(side="left", padx=5)
+
+        # Median Filter (tab 2)
+        median_frame = ttk.LabelFrame(
+            filters_tab, text="Median Filter", padding=10
+        )
+        median_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(median_frame, text="Kernel Size:").pack(anchor="w")
+        median_combo = ttk.Combobox(
+            median_frame,
+            textvariable=self.median_filter_var,
+            values=["MEDIAN_OFF", "KERNEL_3x3", "KERNEL_5x5", "KERNEL_7x7"],
+            state="readonly",
+        )
+        median_combo.pack(fill="x", pady=2)
+        median_combo.bind("<<ComboboxSelected>>", self.update_median_filter)
+
+        # Temporal Filter
+        temporal_frame = ttk.LabelFrame(
+            filters_tab, text="Temporal Filter", padding=10
+        )
+        temporal_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Checkbutton(
+            temporal_frame,
+            text="Enable",
+            variable=self.temporal_enable_var,
+            command=self.update_temporal_filter,
+        ).pack(anchor="w")
+
+        ttk.Label(temporal_frame, text="Persistency Mode:").pack(anchor="w")
+        temporal_combo = ttk.Combobox(
+            temporal_frame,
+            textvariable=self.temporal_persistency_var,
+            values=[
+                "PERSISTENCY_OFF",
+                "VALID_8_OUT_OF_8",
+                "VALID_2_IN_LAST_3",
+                "VALID_2_IN_LAST_4",
+                "VALID_2_OUT_OF_8",
+                "VALID_1_IN_LAST_2",
+                "VALID_1_IN_LAST_5",
+                "VALID_1_IN_LAST_8",
+                "PERSISTENCY_INDEFINITELY",
+            ],
+            state="readonly",
+        )
+        temporal_combo.pack(fill="x", pady=2)
+        temporal_combo.bind("<<ComboboxSelected>>", self.update_temporal_filter)
+
+        ttk.Label(temporal_frame, text="Alpha:").pack(anchor="w")
+        temporal_alpha_scale = ttk.Scale(
+            temporal_frame,
+            from_=0.0,
+            to=1.0,
+            variable=self.temporal_alpha_var,
+            orient="horizontal",
+            command=self.update_temporal_filter,
+        )
+        temporal_alpha_scale.pack(fill="x", pady=2)
+
+        temporal_alpha_label = ttk.Label(temporal_frame, text="0.1")
+        temporal_alpha_label.pack(anchor="w")
+
+        def update_temporal_alpha_label(*args):
+            temporal_alpha_label.config(
+                text=f"{self.temporal_alpha_var.get():.2f}"
+            )
+
+        self.temporal_alpha_var.trace("w", update_temporal_alpha_label)
+
+        ttk.Label(temporal_frame, text="Delta:").pack(anchor="w")
+        temporal_delta_scale = ttk.Scale(
+            temporal_frame,
+            from_=1,
+            to=100,
+            variable=self.temporal_delta_var,
+            orient="horizontal",
+            command=self.update_temporal_filter,
+        )
+        temporal_delta_scale.pack(fill="x", pady=2)
+
+        temporal_delta_label = ttk.Label(temporal_frame, text="40")
+        temporal_delta_label.pack(anchor="w")
+
+        def update_temporal_delta_label(*args):
+            temporal_delta_label.config(
+                text=f"{int(self.temporal_delta_var.get())}"
+            )
+
+        self.temporal_delta_var.trace("w", update_temporal_delta_label)
+
+        # Speckle Filter
+        speckle_frame = ttk.LabelFrame(
+            filters_tab, text="Speckle Filter", padding=10
+        )
+        speckle_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Checkbutton(
+            speckle_frame,
+            text="Enable",
+            variable=self.speckle_enable_var,
+            command=self.update_speckle_filter,
+        ).pack(anchor="w")
+
+        ttk.Label(speckle_frame, text="Range:").pack(anchor="w")
+        speckle_range_scale = ttk.Scale(
+            speckle_frame,
+            from_=0,
+            to=100,
+            variable=self.speckle_range_var,
+            orient="horizontal",
+            command=self.update_speckle_filter,
+        )
+        speckle_range_scale.pack(fill="x", pady=2)
+
+        speckle_range_label = ttk.Label(speckle_frame, text="50")
+        speckle_range_label.pack(anchor="w")
+
+        def update_speckle_range_label(*args):
+            speckle_range_label.config(
+                text=f"{int(self.speckle_range_var.get())}"
+            )
+
+        self.speckle_range_var.trace("w", update_speckle_range_label)
+
+        ttk.Label(speckle_frame, text="Difference Threshold:").pack(anchor="w")
+        speckle_diff_scale = ttk.Scale(
+            speckle_frame,
+            from_=0,
+            to=255,
+            variable=self.speckle_diff_threshold_var,
+            orient="horizontal",
+            command=self.update_speckle_filter,
+        )
+        speckle_diff_scale.pack(fill="x", pady=2)
+
+        speckle_diff_label = ttk.Label(speckle_frame, text="2")
+        speckle_diff_label.pack(anchor="w")
+
+        def update_speckle_diff_label(*args):
+            speckle_diff_label.config(
+                text=f"{self.speckle_diff_threshold_var.get():.1f}"
+            )
+
+        self.speckle_diff_threshold_var.trace("w", update_speckle_diff_label)
+
+        # Spatial Filter
+        spatial_frame = ttk.LabelFrame(
+            filters_tab, text="Spatial Filter", padding=10
+        )
+        spatial_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Checkbutton(
+            spatial_frame,
+            text="Enable",
+            variable=self.spatial_enable_var,
+            command=self.update_spatial_filter,
+        ).pack(anchor="w")
+
+        ttk.Label(spatial_frame, text="Hole Filling Radius:").pack(anchor="w")
+        spatial_hole_scale = ttk.Scale(
+            spatial_frame,
+            from_=0,
+            to=10,
+            variable=self.spatial_hole_filling_radius_var,
+            orient="horizontal",
+            command=self.update_spatial_filter,
+        )
+        spatial_hole_scale.pack(fill="x", pady=2)
+
+        spatial_hole_label = ttk.Label(spatial_frame, text="2")
+        spatial_hole_label.pack(anchor="w")
+
+        def update_spatial_hole_label(*args):
+            spatial_hole_label.config(
+                text=f"{int(self.spatial_hole_filling_radius_var.get())}"
+            )
+
+        self.spatial_hole_filling_radius_var.trace(
+            "w", update_spatial_hole_label
+        )
+
+        ttk.Label(spatial_frame, text="Alpha:").pack(anchor="w")
+        spatial_alpha_scale = ttk.Scale(
+            spatial_frame,
+            from_=0.0,
+            to=1.0,
+            variable=self.spatial_alpha_var,
+            orient="horizontal",
+            command=self.update_spatial_filter,
+        )
+        spatial_alpha_scale.pack(fill="x", pady=2)
+
+        spatial_alpha_label = ttk.Label(spatial_frame, text="0.5")
+        spatial_alpha_label.pack(anchor="w")
+
+        def update_spatial_alpha_label(*args):
+            spatial_alpha_label.config(
+                text=f"{self.spatial_alpha_var.get():.2f}"
+            )
+
+        self.spatial_alpha_var.trace("w", update_spatial_alpha_label)
+
+        ttk.Label(spatial_frame, text="Delta:").pack(anchor="w")
+        spatial_delta_scale = ttk.Scale(
+            spatial_frame,
+            from_=1,
+            to=20,
+            variable=self.spatial_delta_var,
+            orient="horizontal",
+            command=self.update_spatial_filter,
+        )
+        spatial_delta_scale.pack(fill="x", pady=2)
+
+        spatial_delta_label = ttk.Label(spatial_frame, text="3")
+        spatial_delta_label.pack(anchor="w")
+
+        def update_spatial_delta_label(*args):
+            spatial_delta_label.config(
+                text=f"{int(self.spatial_delta_var.get())}"
+            )
+
+        self.spatial_delta_var.trace("w", update_spatial_delta_label)
+
+        ttk.Label(spatial_frame, text="Iterations:").pack(anchor="w")
+        spatial_iter_scale = ttk.Scale(
+            spatial_frame,
+            from_=1,
+            to=10,
+            variable=self.spatial_num_iterations_var,
+            orient="horizontal",
+            command=self.update_spatial_filter,
+        )
+        spatial_iter_scale.pack(fill="x", pady=2)
+
+        spatial_iter_label = ttk.Label(spatial_frame, text="1")
+        spatial_iter_label.pack(anchor="w")
+
+        def update_spatial_iter_label(*args):
+            spatial_iter_label.config(
+                text=f"{int(self.spatial_num_iterations_var.get())}"
+            )
+
+        self.spatial_num_iterations_var.trace("w", update_spatial_iter_label)
+
+        # ToF Base Config (tab 3)
+        tof_frame = ttk.LabelFrame(
+            tof_tab, text="ToF Base Config", padding=10
+        )
+        tof_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Checkbutton(
+            tof_frame,
+            text="Phase Unwrapping",
+            variable=self.enable_phase_unwrapping_var,
+            command=self.update_tof_base_config,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            tof_frame,
+            text="Phase Shuffle Filter",
+            variable=self.enable_phase_shuffle_var,
+            command=self.update_tof_base_config,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            tof_frame,
+            text="Temperature Correction",
+            variable=self.enable_temperature_correction_var,
+            command=self.update_tof_base_config,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            tof_frame,
+            text="FPPN Correction",
+            variable=self.enable_fppn_correction_var,
+            command=self.update_tof_base_config,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            tof_frame,
+            text="Optical Correction",
+            variable=self.enable_optical_correction_var,
+            command=self.update_tof_base_config,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            tof_frame,
+            text="Wiggle Correction",
+            variable=self.enable_wiggle_correction_var,
+            command=self.update_tof_base_config,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            tof_frame,
+            text="Distortion Correction",
+            variable=self.enable_distortion_correction_var,
+            command=self.update_tof_base_config,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            tof_frame,
+            text="Burst Mode",
+            variable=self.enable_burst_mode_var,
+            command=self.update_tof_base_config,
+        ).pack(anchor="w")
+
+        ttk.Label(tof_frame, text="Phase Unwrap Threshold:").pack(anchor="w")
+        ttk.Scale(
+            tof_frame,
+            from_=0.0,
+            to=4.0,
+            variable=self.phase_unwrap_threshold_var,
+            orient="horizontal",
+            command=self.update_tof_base_config,
+        ).pack(fill="x", pady=2)
+
+        phase_threshold_label = ttk.Label(tof_frame, text="2.0")
+        phase_threshold_label.pack(anchor="w")
+
+        def update_phase_threshold_label(*args):
+            phase_threshold_label.config(
+                text=f"{self.phase_unwrap_threshold_var.get():.2f}"
+            )
+
+        self.phase_unwrap_threshold_var.trace("w", update_phase_threshold_label)
+
+        ttk.Label(tof_frame, text="Phase Unwrap Level:").pack(anchor="w")
+        ttk.Scale(
+            tof_frame,
+            from_=0,
+            to=10,
+            variable=self.phase_unwrap_level_var,
+            orient="horizontal",
+            command=self.update_tof_base_config,
+        ).pack(fill="x", pady=2)
+
+        phase_level_label = ttk.Label(tof_frame, text="5")
+        phase_level_label.pack(anchor="w")
+
+        def update_phase_level_label(*args):
+            phase_level_label.config(
+                text=f"{int(self.phase_unwrap_level_var.get())}"
+            )
+
+        self.phase_unwrap_level_var.trace("w", update_phase_level_label)
+
+        confidence_frame = ttk.LabelFrame(
+            tof_tab, text="Confidence Filter", padding=10
+        )
+        confidence_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(confidence_frame, text="Confidence Threshold:").pack(anchor="w")
+        confidence_scale = ttk.Scale(
+            confidence_frame,
+            from_=0,
+            to=255,
+            variable=self.confidence_threshold_var,
+            orient="horizontal",
+            command=self.update_confidence_filter,
+        )
+        confidence_scale.pack(fill="x", pady=2)
+
+        confidence_label = ttk.Label(confidence_frame, text="128")
+        confidence_label.pack(anchor="w")
+
+        def update_confidence_label(*args):
+            confidence_label.config(
+                text=f"{int(self.confidence_threshold_var.get())}"
+            )
+
+        self.confidence_threshold_var.trace("w", update_confidence_label)
+
+    def update_tof_base_config(self, event=None):
+        if self.base_config_queue is None:
+            return
+        try:
+            config = dai.ToFConfig()
+            config.phaseUnwrapErrorThreshold = self.phase_unwrap_threshold_var.get()
+            config.phaseUnwrappingLevel = self.phase_unwrap_level_var.get()
+            config.enablePhaseUnwrapping = self.enable_phase_unwrapping_var.get()
+            config.enablePhaseShuffleTemporalFilter = (
+                self.enable_phase_shuffle_var.get()
+            )
+            config.enableTemperatureCorrection = (
+                self.enable_temperature_correction_var.get()
+            )
+            config.enableFPPNCorrection = self.enable_fppn_correction_var.get()
+            config.enableOpticalCorrection = self.enable_optical_correction_var.get()
+            config.enableWiggleCorrection = self.enable_wiggle_correction_var.get()
+            config.enableDistortionCorrection = (
+                self.enable_distortion_correction_var.get()
+            )
+            config.enableBurstMode = self.enable_burst_mode_var.get()
+            self.base_config_queue.send(config)
+        except Exception as e:
+            print(f"Error updating ToF base config: {e}")
+
+    def update_confidence_filter(self, event=None):
+        if self.confidence_config_queue is None:
+            return
+        try:
+            config = dai.ToFDepthConfidenceFilterConfig()
+            config.confidenceThreshold = self.confidence_threshold_var.get()
+            self.confidence_config_queue.send(config)
+        except Exception as e:
+            print(f"Error updating confidence filter: {e}")
+
+    def update_pointcloud_settings(self, event=None):
+        global pointcloud_params
+        pointcloud_params["enabled"] = self.pointcloud_enable_var.get()
+        pointcloud_params["decimation"] = self.pointcloud_decimation_var.get()
+        pointcloud_params["max_distance"] = self.pointcloud_max_distance_var.get()
+        pointcloud_params["x_min"] = self.pointcloud_x_min_var.get()
+        pointcloud_params["x_max"] = self.pointcloud_x_max_var.get()
+        pointcloud_params["y_min"] = self.pointcloud_y_min_var.get()
+        pointcloud_params["y_max"] = self.pointcloud_y_max_var.get()
+
+        if pointcloud_params["enabled"] and not pointcloud_running:
+            start_pointcloud_thread()
+        elif not pointcloud_params["enabled"] and pointcloud_running:
+            stop_pointcloud_thread()
+
+    def toggle_pause(self):
+        new_state = toggle_pause()
+        status = "⏸️ PAUSED" if new_state else "🔴 LIVE"
+        print(f"{status} Point cloud updates {'paused' if new_state else 'resumed'}")
+
+    def get_median_filter_params(self):
+        filter_map = {
+            "MEDIAN_OFF": dai.node.ImageFilters.MedianFilterParams.MEDIAN_OFF,
+            "KERNEL_3x3": dai.node.ImageFilters.MedianFilterParams.KERNEL_3x3,
+            "KERNEL_5x5": dai.node.ImageFilters.MedianFilterParams.KERNEL_5x5,
+            "KERNEL_7x7": dai.node.ImageFilters.MedianFilterParams.KERNEL_7x7,
+        }
+        return filter_map[self.median_filter_var.get()]
+
+    def get_temporal_filter_params(self):
+        params = dai.node.ImageFilters.TemporalFilterParams()
+        params.enable = self.temporal_enable_var.get()
+
+        persistency_map = {
+            "PERSISTENCY_OFF": dai.filters.params.TemporalFilter.PersistencyMode.PERSISTENCY_OFF,
+            "VALID_8_OUT_OF_8": dai.filters.params.TemporalFilter.PersistencyMode.VALID_8_OUT_OF_8,
+            "VALID_2_IN_LAST_3": dai.filters.params.TemporalFilter.PersistencyMode.VALID_2_IN_LAST_3,
+            "VALID_2_IN_LAST_4": dai.filters.params.TemporalFilter.PersistencyMode.VALID_2_IN_LAST_4,
+            "VALID_2_OUT_OF_8": dai.filters.params.TemporalFilter.PersistencyMode.VALID_2_OUT_OF_8,
+            "VALID_1_IN_LAST_2": dai.filters.params.TemporalFilter.PersistencyMode.VALID_1_IN_LAST_2,
+            "VALID_1_IN_LAST_5": dai.filters.params.TemporalFilter.PersistencyMode.VALID_1_IN_LAST_5,
+            "VALID_1_IN_LAST_8": dai.filters.params.TemporalFilter.PersistencyMode.VALID_1_IN_LAST_8,
+            "PERSISTENCY_INDEFINITELY": dai.filters.params.TemporalFilter.PersistencyMode.PERSISTENCY_INDEFINITELY,
+        }
+        params.persistencyMode = persistency_map[self.temporal_persistency_var.get()]
+        params.alpha = self.temporal_alpha_var.get()
+        params.delta = self.temporal_delta_var.get()
+        return params
+
+    def get_speckle_filter_params(self):
+        params = dai.node.ImageFilters.SpeckleFilterParams()
+        params.enable = self.speckle_enable_var.get()
+        params.speckleRange = self.speckle_range_var.get()
+        params.differenceThreshold = self.speckle_diff_threshold_var.get()
+        return params
+
+    def get_spatial_filter_params(self):
+        params = dai.node.ImageFilters.SpatialFilterParams()
+        params.enable = self.spatial_enable_var.get()
+        params.holeFillingRadius = self.spatial_hole_filling_radius_var.get()
+        params.alpha = self.spatial_alpha_var.get()
+        params.delta = self.spatial_delta_var.get()
+        params.numIterations = self.spatial_num_iterations_var.get()
+        return params
+
+    def update_temporal_filter(self, event=None):
+        params = self.get_temporal_filter_params()
+        config = dai.ImageFiltersConfig().updateFilterAtIndex(index=0, params=params)
+        self.config_queue.send(config)
+
+    def update_speckle_filter(self, event=None):
+        params = self.get_speckle_filter_params()
+        config = dai.ImageFiltersConfig().updateFilterAtIndex(index=1, params=params)
+        self.config_queue.send(config)
+
+    def update_spatial_filter(self, event=None):
+        params = self.get_spatial_filter_params()
+        config = dai.ImageFiltersConfig().updateFilterAtIndex(index=2, params=params)
+        self.config_queue.send(config)
+
+    def update_median_filter(self, event=None):
+        params = self.get_median_filter_params()
+        config = dai.ImageFiltersConfig().updateFilterAtIndex(index=3, params=params)
+        self.config_queue.send(config)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def get_initial_filter_params():
+    """
+    The index order here must match the update_* functions:
+    0 = temporal, 1 = speckle, 2 = spatial, 3 = median.
+    """
+
+    temporal_params = dai.node.ImageFilters.TemporalFilterParams()
+    temporal_params.enable = False
+    temporal_params.persistencyMode = (
+        dai.filters.params.TemporalFilter.PersistencyMode.PERSISTENCY_OFF
+    )
+    temporal_params.alpha = 0.6
+    temporal_params.delta = 3
+
+    speckle_params = dai.node.ImageFilters.SpeckleFilterParams()
+    speckle_params.enable = False
+    speckle_params.speckleRange = 50
+    speckle_params.differenceThreshold = 50
+
+    spatial_params = dai.node.ImageFilters.SpatialFilterParams()
+    spatial_params.enable = False
+    spatial_params.holeFillingRadius = 2
+    spatial_params.alpha = 0.5
+    spatial_params.delta = 3
+    spatial_params.numIterations = 1
+
+    median_params = dai.node.ImageFilters.MedianFilterParams.MEDIAN_OFF
+
+    return [temporal_params, speckle_params, spatial_params, median_params]
+
+
+def colorizeDepth(frameDepth: np.ndarray) -> np.ndarray:
+    invalidMask = frameDepth == 0
+    try:
+        minDepth = np.percentile(frameDepth[frameDepth != 0], 3)
+        maxDepth = np.percentile(frameDepth[frameDepth != 0], 95)
+        logDepth = np.log(frameDepth, where=frameDepth != 0)
+        logMinDepth = np.log(minDepth)
+        logMaxDepth = np.log(maxDepth)
+        np.nan_to_num(logDepth, copy=False, nan=logMinDepth)
+        logDepth = np.clip(logDepth, logMinDepth, logMaxDepth)
+        depthFrameColor = np.interp(logDepth, (logMinDepth, logMaxDepth), (0, 255))
+        depthFrameColor = np.nan_to_num(depthFrameColor)
+        depthFrameColor = depthFrameColor.astype(np.uint8)
+        depthFrameColor = cv2.applyColorMap(depthFrameColor, cv2.COLORMAP_JET)
+        depthFrameColor[invalidMask] = 0
+
+        status_text = "PAUSED" if is_paused() else "LIVE"
+        status_color = (0, 255, 255) if is_paused() else (0, 255, 0)
+        cv2.putText(
+            depthFrameColor,
+            f"Point Clouds: {status_text}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            status_color,
+            2,
+        )
+        cv2.putText(
+            depthFrameColor,
+            "Press 's' to SAVE",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (200, 200, 200),
+            1,
+        )
+    except IndexError:
+        depthFrameColor = np.zeros(
+            (frameDepth.shape[0], frameDepth.shape[1], 3), dtype=np.uint8
+        )
+    return depthFrameColor
+
+
+def camera_pipeline(gui):
+    pipeline = dai.Pipeline()
+
+    # 为多相机场景设置目标设备信息
+    device_info = None
+    if TARGET_DEVICE_IP:
+        try:
+            device_info = dai.DeviceInfo(TARGET_DEVICE_IP)
+            print(f"🎯 Target device IP set to {TARGET_DEVICE_IP}")
+        except Exception as e:
+            print(f"⚠️ Failed to set target device IP {TARGET_DEVICE_IP}: {e}")
+
+    # RGB camera
+    camRgb = pipeline.create(dai.node.Camera)
+    camRgb.build(RGB_SOCKET, (1280, 800), 30.0)
+    camRgb.setOutputsNumFramesPool(1)
+    rgbOut = camRgb.requestOutput((640, 400))
+
+    # ToF node
+    tof = pipeline.create(dai.node.ToF)
+    tof.build(TOF_SOCKET, dai.ImageFiltersPresetMode.TOF_MID_RANGE, 30.0)
+
+    # Alignment on host
+    align = pipeline.create(dai.node.ImageAlign)
+    align.setOutputSize(640, 400)
+    align.setRunOnHost(True)
+    tof.depth.link(align.input)
+    rgbOut.link(align.inputAlignTo)
+
+    # Sync on host
+    sync = pipeline.create(dai.node.Sync)
+    sync.setSyncThreshold(timedelta(seconds=0.05))
+    sync.setRunOnHost(True)
+    align.outputAligned.link(sync.inputs["aligned_depth"])
+    rgbOut.link(sync.inputs["rgb"])
+
+    syncQueue = sync.out.createOutputQueue(maxSize=4, blocking=False)
+
+    try:
+        calibration = pipeline.getDefaultDevice().readCalibration()
+        intr = calibration.getCameraIntrinsics(RGB_SOCKET, 640, 400)
+        CAMERA_INTRINSICS["fx"], CAMERA_INTRINSICS["fy"] = intr[0][0], intr[1][1]
+        CAMERA_INTRINSICS["cx"], CAMERA_INTRINSICS["cy"] = intr[0][2], intr[1][2]
+        print(f"✅ Intrinsics loaded: {CAMERA_INTRINSICS}")
+    except Exception as e:
+        print(f"⚠️ Could not get intrinsics: {e}. Using defaults.")
+        CAMERA_INTRINSICS["fx"], CAMERA_INTRINSICS["fy"] = 500, 500
+        CAMERA_INTRINSICS["cx"], CAMERA_INTRINSICS["cy"] = 320, 200
+
+    gui.config_queue = tof.imageFiltersInputConfig.createInputQueue()
+    gui.base_config_queue = tof.tofBaseInputConfig.createInputQueue()
+    gui.confidence_config_queue = (
+        tof.tofDepthConfidenceFilterInputConfig.createInputQueue()
+    )
+
+    with pipeline:
+        if device_info is not None:
+            try:
+                pipeline.start(device_info)
+            except Exception as e:
+                print(
+                    f"⚠️ Could not start pipeline on {TARGET_DEVICE_IP}: {e}. Falling back to any available device."
+                )
+                pipeline.start()
+        else:
+            pipeline.start()
+
+        initial_filters = get_initial_filter_params()
+        gui.config_queue.send(
+            dai.ImageFiltersConfig()
+            .updateFilterAtIndex(index=0, params=initial_filters[0])
+            .updateFilterAtIndex(index=1, params=initial_filters[1])
+            .updateFilterAtIndex(index=2, params=initial_filters[2])
+            .updateFilterAtIndex(index=3, params=initial_filters[3])
+        )
+
+        if pointcloud_params["enabled"]:
+            start_pointcloud_thread()
+
+        print("🚀 Pipeline started! Press 's' to save, 'q' to quit.")
+
+        while pipeline.isRunning():
+            msgGroup = syncQueue.get()
+            depth_msg = msgGroup["aligned_depth"]
+            color_msg = msgGroup["rgb"]
+
+            if depth_msg and color_msg:
+                depth_frame = depth_msg.getFrame()
+                color_frame = color_msg.getCvFrame()
+
+                if MANUAL_ROTATE_TOF_180:
+                    depth_frame = cv2.flip(depth_frame, -1)
+                    color_frame = cv2.flip(color_frame, -1)
+
+                latest_frames["final_depth"] = depth_frame
+                latest_frames["color"] = color_frame
+
+                cv2.imshow("Color (RGB)", color_frame)
+
+                depth_vis = colorizeDepth(depth_frame)
+                cv2.imshow("Aligned Depth", depth_vis)
+
+                if not is_paused():
+                    update_pointcloud_data()
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord("p"):
+                toggle_pause()
+            elif key == ord("s"):
+                save_all_data()
+            elif key == ord("2"):
+                update_pointcloud_manual()
+            elif key == ord("v"):
+                reset_pointcloud_view()
+
+    stop_pointcloud_thread()
+
+
+def main():
+    gui = FilterGUI(None)
+    t = threading.Thread(target=camera_pipeline, args=(gui,))
+    t.daemon = True
+    t.start()
+    gui.run()
+
+
+if __name__ == "__main__":
+    main()
